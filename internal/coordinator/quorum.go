@@ -18,6 +18,11 @@ var (
 	ErrReadQuorumFailed  = errors.New("read quorum (R) not reached")
 )
 
+// HintSink records failed replica writes for asynchronous Hinted Handoff replay.
+type HintSink interface {
+	Enqueue(targetNodeID, targetURL string, rec version.VersionedRecord)
+}
+
 type Config struct {
 	NodeID  string
 	N       int
@@ -27,9 +32,10 @@ type Config struct {
 }
 
 type Coordinator struct {
-	cfg    Config
-	ring   *ring.Ring
-	client *transport.Client
+	cfg      Config
+	ring     *ring.Ring
+	client   *transport.Client
+	hintSink HintSink
 
 	mu          sync.RWMutex
 	peers       map[string]string
@@ -46,6 +52,12 @@ func New(cfg Config, r *ring.Ring, client *transport.Client) *Coordinator {
 		client: client,
 		peers:  make(map[string]string),
 	}
+}
+
+func (c *Coordinator) SetHintSink(sink HintSink) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hintSink = sink
 }
 
 func (c *Coordinator) RegisterPeer(nodeID, baseURL string) {
@@ -96,9 +108,14 @@ func (c *Coordinator) writeRecord(ctx context.Context, key string, value []byte,
 
 	type writeResult struct {
 		nodeID string
+		url    string
 		err    error
 	}
 	resCh := make(chan writeResult, len(replicas))
+
+	c.mu.RLock()
+	sink := c.hintSink
+	c.mu.RUnlock()
 
 	for _, nodeID := range replicas {
 		url, ok := c.PeerURL(nodeID)
@@ -108,7 +125,10 @@ func (c *Coordinator) writeRecord(ctx context.Context, key string, value []byte,
 		}
 		go func(id, peerURL string) {
 			_, putErr := c.client.PutReplica(reqCtx, peerURL, rec)
-			resCh <- writeResult{nodeID: id, err: putErr}
+			if putErr != nil && sink != nil {
+				sink.Enqueue(id, peerURL, rec)
+			}
+			resCh <- writeResult{nodeID: id, url: peerURL, err: putErr}
 		}(nodeID, url)
 	}
 
@@ -134,8 +154,6 @@ type replicaReadResult struct {
 	err    error
 }
 
-// Get executes a scatter-gather read across N replicas, reconciles versions across R responses,
-// and triggers asynchronous Read Repair on any replica that returned a stale or missing version.
 func (c *Coordinator) Get(ctx context.Context, key string) (version.VersionedRecord, bool, error) {
 	replicas, err := c.ring.GetPreferenceList(key, c.cfg.N)
 	if err != nil {
@@ -197,7 +215,6 @@ func (c *Coordinator) Get(ctx context.Context, key string) (version.VersionedRec
 		return version.VersionedRecord{}, false, nil
 	}
 
-	// Trigger asynchronous Read Repair on any replica whose record is missing or causally behind winner
 	c.triggerReadRepair(winner, successResponses)
 
 	if winner.Tombstone {
