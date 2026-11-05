@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/m-pedro/godistkv/internal/ring"
@@ -18,11 +19,11 @@ var (
 )
 
 type Config struct {
-	NodeID    string
-	N         int
-	R         int
-	W         int
-	Timeout   time.Duration
+	NodeID  string
+	N       int
+	R       int
+	W       int
+	Timeout time.Duration
 }
 
 type Coordinator struct {
@@ -30,8 +31,9 @@ type Coordinator struct {
 	ring   *ring.Ring
 	client *transport.Client
 
-	mu    sync.RWMutex
-	peers map[string]string // nodeID -> base HTTP URL (e.g. "http://127.0.0.1:8001")
+	mu          sync.RWMutex
+	peers       map[string]string
+	readRepairs atomic.Uint64
 }
 
 func New(cfg Config, r *ring.Ring, client *transport.Client) *Coordinator {
@@ -60,13 +62,14 @@ func (c *Coordinator) PeerURL(nodeID string) (string, bool) {
 	return u, ok
 }
 
-// Put coordinates a scatter-gather Dynamo write across N preference-list replicas
-// and succeeds as soon as W replicas acknowledge.
+func (c *Coordinator) ReadRepairsCompleted() uint64 {
+	return c.readRepairs.Load()
+}
+
 func (c *Coordinator) Put(ctx context.Context, key string, value []byte) (version.VersionedRecord, error) {
 	return c.writeRecord(ctx, key, value, false)
 }
 
-// Delete coordinates a tombstone write across N preference-list replicas with W quorum.
 func (c *Coordinator) Delete(ctx context.Context, key string) (version.VersionedRecord, error) {
 	return c.writeRecord(ctx, key, nil, true)
 }
@@ -77,7 +80,6 @@ func (c *Coordinator) writeRecord(ctx context.Context, key string, value []byte,
 		return version.VersionedRecord{}, err
 	}
 
-	// Read existing highest clock from coordinator's first reachable replica (or start fresh)
 	baseClock := c.fetchBaseClock(ctx, key, replicas)
 	nextClock := baseClock.Increment(c.cfg.NodeID)
 
@@ -124,21 +126,6 @@ func (c *Coordinator) writeRecord(ctx context.Context, key string, value []byte,
 	return version.VersionedRecord{}, fmt.Errorf("%w: got %d/%d acks", ErrWriteQuorumFailed, acks, c.cfg.W)
 }
 
-func (c *Coordinator) fetchBaseClock(ctx context.Context, key string, replicas []string) version.VectorClock {
-	probeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-
-	merged := version.New()
-	for _, nodeID := range replicas {
-		if url, ok := c.PeerURL(nodeID); ok {
-			if rec, found, err := c.client.GetReplica(probeCtx, url, key); err == nil && found {
-				merged = merged.Merge(rec.Clock)
-			}
-		}
-	}
-	return merged
-}
-
 type replicaReadResult struct {
 	nodeID string
 	url    string
@@ -147,8 +134,8 @@ type replicaReadResult struct {
 	err    error
 }
 
-// Get executes a parallel scatter-gather read across N replicas, waits for R responses,
-// and reconciles conflicting versions using VectorClock + LWW resolution.
+// Get executes a scatter-gather read across N replicas, reconciles versions across R responses,
+// and triggers asynchronous Read Repair on any replica that returned a stale or missing version.
 func (c *Coordinator) Get(ctx context.Context, key string) (version.VersionedRecord, bool, error) {
 	replicas, err := c.ring.GetPreferenceList(key, c.cfg.N)
 	if err != nil {
@@ -197,17 +184,55 @@ func (c *Coordinator) Get(ctx context.Context, key string) (version.VersionedRec
 				winner = version.ResolveWinner(winner, res.rec)
 			}
 		}
-
-		if len(successResponses) >= c.cfg.R {
-			if !haveWinner || winner.Tombstone {
-				return version.VersionedRecord{}, false, nil
-			}
-			return winner, true, nil
-		}
 	}
 
-	return version.VersionedRecord{}, false, fmt.Errorf(
-		"%w: got %d/%d responses",
-		ErrReadQuorumFailed, len(successResponses), c.cfg.R,
-	)
+	if len(successResponses) < c.cfg.R {
+		return version.VersionedRecord{}, false, fmt.Errorf(
+			"%w: got %d/%d responses",
+			ErrReadQuorumFailed, len(successResponses), c.cfg.R,
+		)
+	}
+
+	if !haveWinner {
+		return version.VersionedRecord{}, false, nil
+	}
+
+	// Trigger asynchronous Read Repair on any replica whose record is missing or causally behind winner
+	c.triggerReadRepair(winner, successResponses)
+
+	if winner.Tombstone {
+		return version.VersionedRecord{}, false, nil
+	}
+	return winner, true, nil
+}
+
+func (c *Coordinator) triggerReadRepair(winner version.VersionedRecord, responses []replicaReadResult) {
+	for _, res := range responses {
+		needsRepair := !res.found || res.rec.Clock.Compare(winner.Clock) != version.Equal
+		if needsRepair && res.url != "" {
+			peerURL := res.url
+			go func() {
+				repairCtx, cancel := context.WithTimeout(context.Background(), c.cfg.Timeout)
+				defer cancel()
+				if _, err := c.client.PutReplica(repairCtx, peerURL, winner); err == nil {
+					c.readRepairs.Add(1)
+				}
+			}()
+		}
+	}
+}
+
+func (c *Coordinator) fetchBaseClock(ctx context.Context, key string, replicas []string) version.VectorClock {
+	probeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+
+	merged := version.New()
+	for _, nodeID := range replicas {
+		if url, ok := c.PeerURL(nodeID); ok {
+			if rec, found, err := c.client.GetReplica(probeCtx, url, key); err == nil && found {
+				merged = merged.Merge(rec.Clock)
+			}
+		}
+	}
+	return merged
 }
