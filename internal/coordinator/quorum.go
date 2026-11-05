@@ -138,3 +138,76 @@ func (c *Coordinator) fetchBaseClock(ctx context.Context, key string, replicas [
 	}
 	return merged
 }
+
+type replicaReadResult struct {
+	nodeID string
+	url    string
+	rec    version.VersionedRecord
+	found  bool
+	err    error
+}
+
+// Get executes a parallel scatter-gather read across N replicas, waits for R responses,
+// and reconciles conflicting versions using VectorClock + LWW resolution.
+func (c *Coordinator) Get(ctx context.Context, key string) (version.VersionedRecord, bool, error) {
+	replicas, err := c.ring.GetPreferenceList(key, c.cfg.N)
+	if err != nil {
+		return version.VersionedRecord{}, false, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
+
+	resCh := make(chan replicaReadResult, len(replicas))
+	for _, nodeID := range replicas {
+		url, ok := c.PeerURL(nodeID)
+		if !ok {
+			resCh <- replicaReadResult{nodeID: nodeID, err: fmt.Errorf("unknown peer %s", nodeID)}
+			continue
+		}
+		go func(id, peerURL string) {
+			rec, found, getErr := c.client.GetReplica(reqCtx, peerURL, key)
+			resCh <- replicaReadResult{
+				nodeID: id,
+				url:    peerURL,
+				rec:    rec,
+				found:  found,
+				err:    getErr,
+			}
+		}(nodeID, url)
+	}
+
+	var (
+		successResponses []replicaReadResult
+		haveWinner       bool
+		winner           version.VersionedRecord
+	)
+
+	for i := 0; i < len(replicas); i++ {
+		res := <-resCh
+		if res.err != nil {
+			continue
+		}
+		successResponses = append(successResponses, res)
+		if res.found {
+			if !haveWinner {
+				winner = res.rec
+				haveWinner = true
+			} else {
+				winner = version.ResolveWinner(winner, res.rec)
+			}
+		}
+
+		if len(successResponses) >= c.cfg.R {
+			if !haveWinner || winner.Tombstone {
+				return version.VersionedRecord{}, false, nil
+			}
+			return winner, true, nil
+		}
+	}
+
+	return version.VersionedRecord{}, false, fmt.Errorf(
+		"%w: got %d/%d responses",
+		ErrReadQuorumFailed, len(successResponses), c.cfg.R,
+	)
+}
