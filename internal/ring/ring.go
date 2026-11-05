@@ -1,16 +1,17 @@
 package ring
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sort"
 	"sync"
 )
 
 var (
-	ErrEmptyRing      = errors.New("consistent hash ring has no nodes")
-	ErrInvalidVnodes  = errors.New("virtual node count must be > 0")
+	ErrEmptyRing     = errors.New("consistent hash ring has no nodes")
+	ErrInvalidVnodes = errors.New("virtual node count must be > 0")
 )
 
 type vnode struct {
@@ -20,10 +21,10 @@ type vnode struct {
 
 // Ring implements a thread-safe consistent hashing ring with virtual nodes.
 type Ring struct {
-	mu          sync.RWMutex
-	vnodeCount  int
-	vnodes      []vnode
-	nodes       map[string]struct{}
+	mu         sync.RWMutex
+	vnodeCount int
+	vnodes     []vnode
+	nodes      map[string]struct{}
 }
 
 func New(vnodeCount int) (*Ring, error) {
@@ -133,9 +134,8 @@ func (r *Ring) Nodes() []string {
 	return out
 }
 
-// HashKey computes the 32-bit FNV-1a hash of a key.
+// HashKey computes a uniformly distributed 32-bit token using SHA-256.
 func HashKey(key string) uint32 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return h.Sum32()
+	sum := sha256.Sum256([]byte(key))
+	return binary.LittleEndian.Uint32(sum[:4])
 }
