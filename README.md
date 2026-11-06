@@ -1,6 +1,6 @@
 # godistkv
 
-A Dynamo-inspired distributed consistent-hashing key-value cluster written in Go using **100% standard library packages**. Engineered with SHA-256 virtual-node (`vnode`) consistent hashing, tunable N/R/W quorum replication, causal Vector Clocks with Last-Write-Wins (LWW) conflict resolution, asynchronous Read Repair, and Sloppy Quorum Hinted Handoff.
+A Dynamo-inspired distributed consistent-hashing key-value cluster written in Go using 100% standard library packages. Engineered with SHA-256 virtual-node (`vnode`) consistent hashing, tunable N/R/W quorum replication, causal Vector Clocks with Last-Write-Wins (LWW) conflict resolution, asynchronous Read Repair, and Sloppy Quorum Hinted Handoff.
 
 ## Repository Structure
 
